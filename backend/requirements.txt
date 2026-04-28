@@ -60,3 +60,4 @@ uvicorn[standard]
 fastapi
 sqlalchemy
 PyJWT
+passlib[bcrypt]
