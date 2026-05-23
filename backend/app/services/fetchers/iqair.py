@@ -1,6 +1,8 @@
 import logging
+import os
+import time
 from datetime import datetime, date
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup  # type: ignore
@@ -15,6 +17,25 @@ HEADERS = {
 }
 TIMEOUT = 15
 RETRIES = 2
+CACHE_TTL_SECONDS = int(os.getenv("IQAIR_CACHE_TTL_SECONDS", "900"))
+BACKOFF_SECONDS = float(os.getenv("IQAIR_BACKOFF_SECONDS", "1.0"))
+
+_cache: Dict[Tuple[Any, ...], Tuple[float, List[Dict[str, Any]]]] = {}
+
+
+def _cache_get(key: Tuple[Any, ...]) -> Optional[List[Dict[str, Any]]]:
+    hit = _cache.get(key)
+    if not hit:
+        return None
+    created_at, rows = hit
+    if time.time() - created_at > CACHE_TTL_SECONDS:
+        _cache.pop(key, None)
+        return None
+    return rows
+
+
+def _cache_set(key: Tuple[Any, ...], rows: List[Dict[str, Any]]) -> None:
+    _cache[key] = (time.time(), rows)
 
 
 def _get(url: str) -> Optional[str]:
@@ -23,9 +44,24 @@ def _get(url: str) -> Optional[str]:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if r.status_code == 200:
                 return r.text
-            logger.warning("IQAir non-200: %s", r.status_code)
+            if r.status_code == 429:
+                retry_after = None
+                try:
+                    retry_after = float(r.headers.get("Retry-After", ""))
+                except Exception:
+                    retry_after = None
+                sleep_for = retry_after or (BACKOFF_SECONDS * (2 ** i))
+                logger.warning("iqair_rate_limited", extra={"status": r.status_code, "attempt": i + 1, "sleep": sleep_for})
+                time.sleep(sleep_for)
+                continue
+            if r.status_code in {403, 404}:
+                logger.warning("iqair_unavailable", extra={"status": r.status_code, "url": url})
+                return None
+            logger.warning("iqair_non_200", extra={"status": r.status_code, "url": url, "attempt": i + 1})
         except Exception as e:
-            logger.warning("IQAir request failed (try %s): %s", i + 1, e)
+            logger.warning("iqair_request_failed", extra={"url": url, "attempt": i + 1, "error": str(e)})
+        if i < RETRIES:
+            time.sleep(BACKOFF_SECONDS * (2 ** i))
     return None
 
 
@@ -37,6 +73,11 @@ def _guess_city_path(city: str) -> str:
 
 def fetch_iqair(city: str, start: date, end: date, lat: float = None, lon: float = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    cache_key = (city.strip().lower(), start.isoformat(), end.isoformat())
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        logger.info("iqair_cache_hit", extra={"city": city, "rows": len(cached)})
+        return list(cached)
     try:
         url = _guess_city_path(city)
         html = _get(url)
@@ -99,7 +140,9 @@ def fetch_iqair(city: str, start: date, end: date, lat: float = None, lon: float
             ts = parse_ts(ts_text) or datetime.utcnow()
             rows.append(make_row(ts=ts, city=city, latitude=lat, longitude=lon, pm25=pm25, pm10=pm10, source="iqair"))
     except Exception as e:
-        logger.warning("fetch_iqair failed: %s", e)
+        logger.warning("fetch_iqair_failed", extra={"city": city, "error": str(e)})
+        rows = []
+    _cache_set(cache_key, rows)
     return rows
 
 

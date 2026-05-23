@@ -1,8 +1,12 @@
 from datetime import datetime, timedelta
 import os
+import logging
 import requests
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+
+logger = logging.getLogger(__name__)
 
 def fetch_open_meteo(lat: float, lon: float, start_date: str, end_date: str):
     url = (
@@ -17,15 +21,17 @@ def fetch_open_meteo(lat: float, lon: float, start_date: str, end_date: str):
         r.raise_for_status()
         return r.json()
     except requests.Timeout:
-        raise RuntimeError("OpenMeteoTimeout: upstream timed out")
+        logger.warning("open_meteo_timeout", extra={"lat": lat, "lon": lon, "start": start_date, "end": end_date})
     except requests.RequestException as e:
-        raise RuntimeError(f"OpenMeteoHTTP: {e}")
+        logger.warning("open_meteo_http_error", extra={"lat": lat, "lon": lon, "start": start_date, "end": end_date, "error": str(e)})
+    return {}
 
 
 def flatten_rows(city: str, lat: float, lon: float, data: dict):
-    times = data["hourly"]["time"]
-    pm25  = data["hourly"].get("pm2_5")
-    pm10  = data["hourly"].get("pm10")
+    hourly = (data or {}).get("hourly") or {}
+    times = hourly.get("time") or []
+    pm25  = hourly.get("pm2_5")
+    pm10  = hourly.get("pm10")
     rows = []
     for i, ts in enumerate(times):
         rows.append({
@@ -33,11 +39,37 @@ def flatten_rows(city: str, lat: float, lon: float, data: dict):
             "city": city,
             "latitude": lat,
             "longitude": lon,
-            "pm25": None if pm25 is None else pm25[i],
-            "pm10": None if pm10 is None else pm10[i],
+            "pm25": None if pm25 is None or i >= len(pm25) else pm25[i],
+            "pm10": None if pm10 is None or i >= len(pm10) else pm10[i],
             "source": "open-meteo",
         })
     return rows
+
+def _fresh_aggregated_count(db: Session, city: str, start: datetime, max_age_minutes: int) -> int:
+    """Return cached row count when the saved aggregate is fresh enough to reuse."""
+    if max_age_minutes <= 0:
+        return 0
+    try:
+        sql = text("""
+            SELECT COUNT(*) AS cnt, MAX(ts) AS newest
+            FROM measurements
+            WHERE city = :city AND source = 'aggregated' AND ts >= :start_ts
+        """)
+        row = db.execute(sql, {"city": city, "start_ts": start.strftime("%Y-%m-%d %H:%M:%S")}).mappings().first()
+        if not row or not row.get("cnt"):
+            return 0
+        newest = row.get("newest")
+        if isinstance(newest, str):
+            newest_dt = datetime.fromisoformat(newest.replace("Z", "+00:00")).replace(tzinfo=None)
+        else:
+            newest_dt = newest
+        if not newest_dt:
+            return 0
+        if datetime.utcnow() - newest_dt <= timedelta(minutes=max_age_minutes):
+            return int(row["cnt"])
+    except Exception:
+        logger.exception("scraper_cache_check_failed", extra={"city": city})
+    return 0
 
 def upsert_rows(db: Session, rows: list[dict]) -> int:
     if not rows:
@@ -104,11 +136,22 @@ def _collect_and_upsert(db: Session, city: str, days: int, sources: list[str] | 
     from .fetchers.waqi import fetch_waqi
     from .fetchers.normalize import make_row, parse_ts
     from .aggregate import combine_by_timestamp
-    lat, lon = get_coords_for_city(db, city)
+    try:
+        lat, lon = get_coords_for_city(db, city)
+    except Exception:
+        logger.exception("geocode_failed", extra={"city": city})
+        return {"geocode": 0, "aggregated": 0}, (None, None)
 
     # use datetime today instead of just date
     end = datetime.utcnow().date()   # or datetime.now().date()
     start = end - timedelta(days=days)
+    start_dt = datetime.combine(start, datetime.min.time())
+
+    cache_minutes = int(os.getenv("SCRAPER_CACHE_TTL_MINUTES", "60"))
+    cached_count = _fresh_aggregated_count(db, city, start_dt, cache_minutes)
+    if cached_count:
+        logger.info("scraper_db_cache_hit", extra={"city": city, "days": days, "rows": cached_count})
+        return {"cached": cached_count, "aggregated": 0}, (lat, lon)
 
     data = fetch_open_meteo(lat, lon, start.isoformat(), end.isoformat())
     rows_open_meteo = flatten_rows(city, lat, lon, data)
@@ -128,6 +171,7 @@ def _collect_and_upsert(db: Session, city: str, days: int, sources: list[str] | 
         try:
             src_rows['openaq'] = fetch_openaq(city, start, end, lat, lon)
         except Exception:
+            logger.exception("openaq_fetch_unhandled", extra={"city": city})
             src_rows['openaq'] = []
 
     # Fetch from IQAir (HTML)
@@ -135,6 +179,7 @@ def _collect_and_upsert(db: Session, city: str, days: int, sources: list[str] | 
         try:
             src_rows['iqair'] = fetch_iqair(city, start, end, lat, lon)
         except Exception:
+            logger.exception("iqair_fetch_unhandled", extra={"city": city})
             src_rows['iqair'] = []
 
     # Fetch from WAQI (API if token present, else HTML)
@@ -143,6 +188,7 @@ def _collect_and_upsert(db: Session, city: str, days: int, sources: list[str] | 
             token = os.getenv('WAQI_TOKEN')
             src_rows['waqi'] = fetch_waqi(city, start, end, lat, lon, token)
         except Exception:
+            logger.exception("waqi_fetch_unhandled", extra={"city": city})
             src_rows['waqi'] = []
 
     # Aggregate combined signal
